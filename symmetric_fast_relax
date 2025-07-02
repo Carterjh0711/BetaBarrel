@@ -1,0 +1,239 @@
+#refine beta barrel
+#Use /net/software/containers/pyrosetta.sif
+#ls -1 | wc -1 *pdb
+#qlogin --mem=24g -c 1 -p cpu
+
+import os
+import sys
+import glob
+import pyrosetta
+from pyrosetta import rosetta
+from pyrosetta import *
+from pyrosetta.rosetta import *
+from pyrosetta.rosetta.core.scoring.constraints import DihedralConstraint
+from pyrosetta.rosetta.core.scoring.func import CircularHarmonicFunc
+from pyrosetta.rosetta.core.scoring.constraints import AtomPairConstraint
+from pyrosetta.rosetta.core.scoring.func import HarmonicFunc
+from pyrosetta.rosetta.core.id import AtomID
+from pyrosetta.rosetta.protocols.relax import FastRelax
+from pyrosetta.rosetta.protocols.backrub import BackrubMover
+import faulthandler
+faulthandler.enable()
+
+def min_torsion(residues, pose):
+	movemap = rosetta.core.kinematics.MoveMap()
+	movemap.set_bb(False)
+	movemap.set_chi(False)
+	for res in residues:
+		movemap.set_bb(res, True)
+		movemap.set_chi(res, True)
+
+	backrub = BackrubMover()
+	backrub.set_movemap(movemap)
+	for _ in range(5):
+		backrub.apply(pose)
+
+	scorefxn = pyrosetta.get_fa_scorefxn()
+	scorefxn.set_weight(rosetta.core.scoring.atom_pair_constraint, 2.0)
+	scorefxn.set_weight(rosetta.core.scoring.dihedral_constraint, 2.0)
+
+	min_mover = rosetta.protocols.minimization_packing.MinMover()
+	min_mover.movemap(movemap)
+	min_mover.score_function(scorefxn)
+	min_mover.min_type("dfpmin_armijo_nonmonotone")
+
+	min_mover.apply(pose)
+
+
+def fast_relax(residues, pose):
+	#Alternative to min_torsion mover
+	scorefxn = pyrosetta.get_fa_scorefxn()
+	scorefxn.set_weight(rosetta.core.scoring.atom_pair_constraint, 1.0)
+	scorefxn.set_weight(rosetta.core.scoring.dihedral_constraint, 0.5)
+	relax = FastRelax()
+	relax.set_scorefxn(scorefxn)
+	movemap = rosetta.core.kinematics.MoveMap()
+	movemap.set_bb(False)
+	movemap.set_chi(False)
+	for res in residues:
+		movemap.set_bb(res, True)
+		movemap.set_chi(res, True)
+	relax.set_movemap(movemap)
+	relax.apply(pose)
+
+
+def dihedral_constraint(residues, pose):
+	for res in residues:
+		# AtomIDs for phi: C(i-1), N(i), CA(i), C(i)
+		phi_atoms = (
+			AtomID(pose.residue(res - 1).atom_index("C"), res - 1),
+			AtomID(pose.residue(res).atom_index("N"), res),
+			AtomID(pose.residue(res).atom_index("CA"), res),
+			AtomID(pose.residue(res).atom_index("C"), res)
+		)
+
+		# AtomIDs for psi: N(i), CA(i), C(i), N(i+1)
+		psi_atoms = (
+			AtomID(pose.residue(res).atom_index("N"), res),
+			AtomID(pose.residue(res).atom_index("CA"), res),
+			AtomID(pose.residue(res).atom_index("C"), res),
+			AtomID(pose.residue(res + 1).atom_index("N"), res + 1)
+		)
+
+		# Define beta strand target angles in radians
+		phi_target = -2.36   # ~-135 degrees
+		psi_target =  2.36   # ~135 degrees
+
+		phi_func = CircularHarmonicFunc(phi_target, 0.3)
+		psi_func = CircularHarmonicFunc(psi_target, 0.3)
+
+		# Create the constraints
+		phi_constraint = DihedralConstraint(*phi_atoms, phi_func)
+		psi_constraint = DihedralConstraint(*psi_atoms, psi_func)
+
+		pose.add_constraint(phi_constraint)
+		pose.add_constraint(psi_constraint)
+
+
+def packer(pose):
+	#Requires the use of an interactive node. Uses a lot of memory. Do not use this version.
+	tf = rosetta.core.pack.task.TaskFactory()
+	tf.push_back(rosetta.core.pack.task.operation.InitializeFromCommandline())
+	packer = rosetta.protocols.minimization_packing.PackRotamersMover()
+	packer.task_factory(tf)
+	packer.score_function(pyrosetta.get_fa_scorefxn())
+	packer.apply(pose)
+	print("Packing done")
+
+
+def new_packer(pose):
+	#Seems to work without an interactive node.
+	scorefxn = pyrosetta.create_score_function('ref2015')
+	task = rosetta.core.pack.task.TaskFactory.create_packer_task(pose)
+	#task.restrict_to_repacking()
+	packer = rosetta.protocols.minimization_packing.PackRotamersMover(scorefxn, task)
+	packer.apply(pose)
+
+
+def initialize_pyrosetta(symdef_file):
+	pyrosetta.init(extra_options=f"-ex1 -ex2aro -symmetry:symmetry_definition {symdef_file}")
+
+
+def get_symdef_file(symmetry_type):
+	symdef_dir = "./symm"
+	symdef_file = f'{symmetry_type}.sym'
+	for file in os.listdir(symdef_dir):
+		if symmetry_type in file:
+			symdef_file = os.path.join(symdef_dir, file)
+			break
+	if symdef_file is None:
+		print(f"Error: No symmetry definition file found for {symmetry_type}")
+		sys.exit(1)
+	return symdef_file
+
+
+def slice_chain(pose, chain_id):
+	chain_pose = rosetta.core.pose.Pose()
+	residue_indices = rosetta.utility.vector1_unsigned_long()
+	for i in range(1, pose.total_residue() + 1):
+		if pose.pdb_info().chain(i) == chain_id:
+			residue_indices.append(i)
+	rosetta.core.pose.pdbslice(chain_pose, pose, residue_indices)
+	return chain_pose
+
+
+def h_bond_constraints(loop_residues, pose):
+	hbond_pairs = []
+	for i in loop_residues:
+		for j in loop_residues:
+			dist = pose.residue(i).xyz("O").distance(pose.residue(j).xyz("N"))
+			if dist < 3.2:
+				hbond_pairs.append((i,j))
+				#print(f"Possible H-bond: A{i} O <--> B{j} N ({dist:.2f} Å)")
+				#print(hbond_pairs)
+
+	for res_i, res_j in hbond_pairs:
+		try:
+			atom_id_i = AtomID(pose.residue(res_i).atom_index("O"), res_i)
+			atom_id_j = AtomID(pose.residue(res_j).atom_index("N"), res_j)
+			func = HarmonicFunc(2.8, 0.3)
+			constraint = AtomPairConstraint(atom_id_i, atom_id_j, func)
+			pose.add_constraint(constraint)
+
+			ca_i = AtomID(pose.residue(res_i).atom_index('CA'), res_i)
+			ca_j = AtomID(pose.residue(res_j).atom_index('CA'), res_j)
+			func_ca = HarmonicFunc(6.0, 0.5)
+			pose.add_constraint(AtomPairConstraint(ca_i, ca_j, func_ca))
+
+		except Exception as e:
+			print(f"Skipping {res_i}-{res_j}: {e}")
+
+
+def select_sym_residues(start_res, end_res, pose):
+	dssp = rosetta.core.scoring.dssp.Dssp(pose)
+	dssp.insert_ss_into_pose(pose)
+	#selected_residues = [i for i in range(1, pose.total_residue() + 1)
+	#						if pose.secstruct(i) == "E"]
+
+	selected = list(range(start_res, end_res + 1))
+	selected = [i for i in selected if pose.secstruct(i) != 'H']
+	print("Selected residues:")
+	for i in selected:
+		print(f"{i}: {pose.residue(i).name()}")
+
+	return selected
+
+
+def sym_pose(pdb_files, index):
+	pdb_path = f'./{str(pdb_files[index])}'
+	symmetry_type = 'C9'
+	# Get the appropriate symmetry definition file
+	symdef_file = get_symdef_file(symmetry_type)
+
+	# Initialize PyRosetta with the specified symmetry definition file
+	initialize_pyrosetta(symdef_file)
+
+	# Load the input structure in PyRosetta
+	pose = pyrosetta.pose_from_file(pdb_path)
+
+	# Ensure only chain A is used
+	chain_a_pose = slice_chain(pose, "A")
+
+	# Apply symmetry setup
+	rosetta.protocols.symmetry.SetupForSymmetryMover(symdef_file).apply(chain_a_pose)
+
+	return chain_a_pose
+
+def main():
+	#pyrosetta.init()
+
+	pdb_files = [f for f in os.listdir('.') if f.endswith('.pdb')]
+	for i in range(len(pdb_files)):
+		pose = sym_pose(pdb_files, i)
+		print("pose_loaded")
+
+		selected_residues = select_sym_residues(75, 86, pose)
+
+		for iteration in range(10):
+			if iteration != 0:
+				pose.remove_constraints()
+			dihedral_constraint(selected_residues, pose)
+			print("Dihedral Complete")
+			h_bond_constraints(selected_residues, pose) 
+			print("H Bond Complete")
+			#min_torsion(selected_residues, pose)
+			#print("Minimization Complete")
+
+			fast_relax(selected_residues, pose)
+			print("Fast Relax Complete")
+			new_packer(pose)
+			print(f"Packing Complete {iteration+1}")
+			
+			if (iteration+1) % 1 == 0:
+				pose.dump_pdb(f"./output/Symmetric_fast_relax_10xMin_{iteration+1}.pdb")
+				print(f"Iteration {iteration+1} Complete")
+		print("Encourage Beta Sheet Complete")	
+
+
+if __name__ == "__main__":
+	main()
